@@ -1,0 +1,46 @@
+# CMake / Ninja / Make out-of-tree builds
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Bazel
+/bazel-bin
+/bazel-out
+/bazel-testlogs
+/bazel-*
+
+# Compiled / link artifacts (if ever generated in-tree)
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Qt Creator / qmake user files
+*.pro.user
+*.pro.user.*
+
+# IDE (local settings; remove these lines if you share editor config in-repo)
+.idea/
+.vscode/
+
+# Editor backups & swap
+*~
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Legacy / other
+/target
