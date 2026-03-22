@@ -4,6 +4,7 @@
 
 #include "usbio/usbio.hh"
 
+#include <algorithm>
 #include <optional>
 #include <iostream>
 #include <vector>
@@ -16,6 +17,12 @@
 #include <iomanip>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
+
+// OBSBOT extension unit 2 / selector 6 uses a 60-byte status blob in this project. Linux uvcvideo
+// requires UVCIOC_CTRL_QUERY.size to match ctrl->info.size from the descriptor (see uvc_xu_ctrl_query
+// in uvc_ctrl.c: size != xqry->size -> -ENOBUFS). USB GET_LEN can report a smaller length than that,
+// so we always transfer 60 bytes for this control.
+constexpr size_t kObsbotXuUnit2Selector6Size = 60;
 
 constexpr uint8_t AUTO_EXP_CMD[18] = {0xaa, 0x25, 0x16, 0x00, 0x0c, 0x00, 0x58, 0x91, 0x0a, 0x02, 0x82, 0x29, 0x05, 0x00, 0xb2, 0xaf, 0x02, 0x04};
 constexpr uint8_t MANUAL_EXP_CMD[18] = {0xaa, 0x25, 0x15, 0x00, 0x0c, 0x00, 0xa8, 0x9e, 0x0a, 0x02, 0x82, 0x29, 0x05, 0x00, 0xf9, 0x27, 0x01, 0x32};
@@ -148,36 +155,112 @@ public:
         return CameraStatus::decode(std::vector<uint8_t>(data.begin(), data.end()));
     }
 
-    void set_ai_mode(AIMode mode) {
-        std::array<uint8_t, 4> cmd;
-        switch (mode) {
-            case AIMode::NoTracking: cmd = {0x16, 0x02, 0x00, 0x00}; break;
-            case AIMode::NormalTracking: cmd = {0x16, 0x02, 0x02, 0x00}; break;
-            case AIMode::UpperBody: cmd = {0x16, 0x02, 0x02, 0x01}; break;
-            case AIMode::DeskMode: cmd = {0x16, 0x02, 0x05, 0x00}; break;
-            case AIMode::Whiteboard: cmd = {0x16, 0x02, 0x04, 0x00}; break;
-            case AIMode::Group: cmd = {0x16, 0x02, 0x01, 0x00}; break;
-            case AIMode::Hand: cmd = {0x16, 0x02, 0x03, 0x00}; break;
-            case AIMode::CloseUp: cmd = {0x16, 0x02, 0x02, 0x02}; break;
-            case AIMode::Headless: cmd = {0x16, 0x02, 0x02, 0x03}; break;
-            case AIMode::LowerBody: cmd = {0x16, 0x02, 0x02, 0x04}; break;
-            default: throw std::runtime_error("Invalid AI mode");
+    /** UVC GET_CUR + decode; nullopt if the device does not return valid status. */
+    std::optional<CameraStatus> try_get_status() {
+        std::array<uint8_t, 60> data{};
+        std::error_code ec = get_cur(0x2, 0x6, data);
+        if (ec) {
+            return std::nullopt;
         }
-        send_cmd(0x2, 0x6, cmd);
+        try {
+            return CameraStatus::decode(std::vector<uint8_t>(data.begin(), data.end()));
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    }
+
+    std::optional<AIMode> try_get_ai_mode() {
+        auto st = try_get_status();
+        if (!st) {
+            return std::nullopt;
+        }
+        return st->ai_mode;
+    }
+
+    /**
+     * Writes AI / tracking mode into the unit-2 selector-6 blob.
+     * OBSBOT expects the USB command prefix 0x16 0x02 plus (m)(n) at bytes 0..3, and the same
+     * logical mode at the status offsets 0x18 / 0x1c that CameraStatus::decode reads. Patching only
+     * 0x18/0x1c produces small PTZ twitches but no tracking; prefix-only at offset 0 was wrong when
+     * wLength was short. We GET_CUR, patch both regions, SET_CUR the full 60 bytes.
+     */
+    bool set_ai_mode(AIMode mode) {
+        uint8_t m = 0;
+        uint8_t n = 0;
+        switch (mode) {
+            case AIMode::NoTracking:
+                m = 0;
+                n = 0;
+                break;
+            case AIMode::NormalTracking:
+                m = 2;
+                n = 0;
+                break;
+            case AIMode::UpperBody:
+                m = 2;
+                n = 1;
+                break;
+            case AIMode::CloseUp:
+                m = 2;
+                n = 2;
+                break;
+            case AIMode::Headless:
+                m = 2;
+                n = 3;
+                break;
+            case AIMode::LowerBody:
+                m = 2;
+                n = 4;
+                break;
+            case AIMode::DeskMode:
+                m = 5;
+                n = 0;
+                break;
+            case AIMode::Whiteboard:
+                m = 4;
+                n = 0;
+                break;
+            case AIMode::Hand:
+                m = 6;
+                n = 0;
+                break;
+            case AIMode::Group:
+                m = 1;
+                n = 0;
+                break;
+            default:
+                throw std::runtime_error("Invalid AI mode");
+        }
+
+        std::array<uint8_t, 60> data{};
+        std::error_code ec = get_cur(0x2, 0x6, data);
+        if (ec) {
+            std::cerr << "set_ai_mode: GET_CUR failed, cannot read-modify-write blob: " << ec.message()
+                      << std::endl;
+            return false;
+        }
+        data[0] = 0x16;
+        data[1] = 0x02;
+        data[2] = m;
+        data[3] = n;
+        data[0x18] = m;
+        data[0x1c] = n;
+        ec = set_cur(0x2, 0x6, data);
+        return !ec;
     }
 
     void set_exposure_mode(ExposureMode mode) {
         switch (mode) {
             case ExposureMode::Manual:
-                send_cmd(0x2, 0x2, MANUAL_EXP_CMD);
+                (void)send_cmd(0x2, 0x2, MANUAL_EXP_CMD, sizeof MANUAL_EXP_CMD);
                 break;
             case ExposureMode::Global:
-                send_cmd(0x2, 0x2, AUTO_EXP_CMD);
-                send_cmd(0x2, 0x6, EXPOSURE_GLOBAL_CMD);
+                (void)send_cmd(0x2, 0x2, AUTO_EXP_CMD, sizeof AUTO_EXP_CMD);
+                (void)send_cmd(0x2, 0x6, EXPOSURE_GLOBAL_CMD, sizeof EXPOSURE_GLOBAL_CMD);
                 break;
             case ExposureMode::Face:
-                send_cmd(0x2, 0x2, AUTO_EXP_CMD);
-                send_cmd(0x2, 0x6, EXPOSURE_FACE_CMD);
+                (void)send_cmd(0x2, 0x2, AUTO_EXP_CMD, sizeof AUTO_EXP_CMD);
+                (void)send_cmd(0x2, 0x6, EXPOSURE_FACE_CMD, sizeof EXPOSURE_FACE_CMD);
                 break;
         }
     }
@@ -188,7 +271,7 @@ public:
             case true: cmd = {0x01, 0x01, 0x01}; break;
             case false: cmd = {0x01, 0x01, 0x00}; break;
         }
-        send_cmd(0x2, 0x6, cmd);
+        (void)send_cmd(0x2, 0x6, cmd);
     }
 
     AIMode get_ai_mode() {
@@ -259,36 +342,77 @@ public:
         setControl(OBSBOT_BACKLIGHT_COMPENSATION, value);
     }
 
+    std::optional<int> try_get_pan() { return try_get_control(OBSBOT_PAN_ABSOLUTE); }
+    std::optional<int> try_get_tilt() { return try_get_control(OBSBOT_TILT_ABSOLUTE); }
+    std::optional<int> try_get_zoom() { return try_get_control(OBSBOT_ZOOM_ABSOLUTE); }
 
-private:
-    template <size_t N>
-    void send_cmd(uint8_t unit, uint8_t selector, const std::array<uint8_t, N>& cmd) {
-        std::array<uint8_t, 60> data = {};
-        std::copy(cmd.begin(), cmd.end(), data.begin());
-        set_cur(unit, selector, data);
+    std::optional<int> try_get_brightness() { return try_get_control(OBSBOT_BRIGHTNESS); }
+    std::optional<int> try_get_contrast() { return try_get_control(OBSBOT_CONTRAST); }
+    std::optional<int> try_get_saturation() { return try_get_control(OBSBOT_SATURATION); }
+    std::optional<int> try_get_hue() { return try_get_control(OBSBOT_HUE); }
+    std::optional<int> try_get_gain() { return try_get_control(OBSBOT_GAIN); }
+    std::optional<int> try_get_sharpness() { return try_get_control(OBSBOT_SHARPNESS); }
+    std::optional<int> try_get_white_balance_temperature() {
+        return try_get_control(OBSBOT_WHITE_BALANCE_TEMPERATURE);
+    }
+    std::optional<int> try_get_backlight_compensation() {
+        return try_get_control(OBSBOT_BACKLIGHT_COMPENSATION);
     }
 
-    void send_cmd(uint8_t unit, uint8_t selector, const uint8_t* cmd, size_t len = 18) {
+private:
+    /** Effective payload size for UVCIOC_CTRL_QUERY (must match kernel ctrl->info.size). */
+    static size_t uvc_query_payload_size(uint8_t unit, uint8_t selector, size_t reported_len,
+                                         size_t buffer_cap) {
+        if (unit == 0x02 && selector == 0x06) {
+            return std::min(kObsbotXuUnit2Selector6Size, buffer_cap);
+        }
+        return std::min(reported_len, buffer_cap);
+    }
+
+    std::optional<int> try_get_control(__u32 id) {
+        struct v4l2_control control {};
+        control.id = id;
+        if (ioctl(handle.fd(), VIDIOC_G_CTRL, &control) == -1) {
+            return std::nullopt;
+        }
+        return control.value;
+    }
+
+    template <size_t N>
+    std::error_code send_cmd(uint8_t unit, uint8_t selector, const std::array<uint8_t, N>& cmd) {
         std::array<uint8_t, 60> data = {};
-        // Copy the command to the data array
+        std::copy(cmd.begin(), cmd.end(), data.begin());
+        return set_cur(unit, selector, data);
+    }
+
+    std::error_code send_cmd(uint8_t unit, uint8_t selector, const uint8_t* cmd, size_t len) {
+        std::array<uint8_t, 60> data = {};
+        if (len > data.size()) {
+            return std::make_error_code(std::errc::invalid_argument);
+        }
         std::copy(cmd, cmd + len, data.begin());
-        set_cur(unit, selector, data);
+        return set_cur(unit, selector, data);
     }
 
     std::error_code get_cur(uint8_t unit, uint8_t selector, std::array<uint8_t, 60>& data) {
-        // always call get_len first
         auto size_result = get_len(unit, selector);
         if (!size_result) {
             return std::make_error_code(std::errc::bad_message);
         }
-        size_t size = size_result.value();
-
-        if (data.size() < size) {
+        const size_t size =
+            uvc_query_payload_size(unit, selector, size_result.value(), data.size());
+        if (size == 0 || size > data.size()) {
             return std::make_error_code(std::errc::no_buffer_space);
         }
 
-        // Perform the IO operation
-        return io(unit, selector, UVC_GET_CUR, data);
+        std::vector<uint8_t> payload(size);
+        std::error_code ec = handle.io(unit, selector, UVC_GET_CUR, payload);
+        if (ec) {
+            return ec;
+        }
+        std::fill(data.begin(), data.end(), 0);
+        std::copy(payload.begin(), payload.end(), data.begin());
+        return {};
     }
 
     std::error_code set_cur(uint8_t unit, uint8_t selector, std::array<uint8_t, 60>& data) {
@@ -296,17 +420,26 @@ private:
         if (!size_result) {
             return std::make_error_code(std::errc::bad_message);
         }
-        size_t size = size_result.value();
-
-        if (data.size() > size) {
+        const size_t size =
+            uvc_query_payload_size(unit, selector, size_result.value(), data.size());
+        if (size == 0 || size > data.size()) {
             return std::make_error_code(std::errc::no_buffer_space);
         }
 
-        std::cout << static_cast<int>(unit) << " " << static_cast<int>(selector) << " " 
-                  << hex_encode(data.data(), data.size()) << std::endl;
+        std::vector<uint8_t> payload(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(size));
+        std::cout << static_cast<int>(unit) << " " << static_cast<int>(selector) << " "
+                  << hex_encode(payload.data(), payload.size()) << std::endl;
 
-        // Perform the IO operation
-        return io(unit, selector, UVC_SET_CUR, data);
+        std::error_code ec = handle.io(unit, selector, UVC_SET_CUR, payload);
+        if (ec) {
+            std::cerr << "UVC SET_CUR failed (unit " << static_cast<int>(unit) << " selector "
+                      << static_cast<int>(selector) << ", wLength " << payload.size();
+            if (size_result) {
+                std::cerr << ", USB GET_LEN was " << size_result.value();
+            }
+            std::cerr << "): " << ec.message() << std::endl;
+        }
+        return ec;
     }
 
     std::optional<size_t> get_len(uint8_t unit, uint8_t selector) {

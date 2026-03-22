@@ -50,8 +50,7 @@ inline int set_format(int fd, int width, int height, uint32_t pix_format = V4L2_
 
     int res = ioctl(fd, VIDIOC_S_FMT, &format);
     if (res == -1) {
-        perror("Could not set format");
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     return res;
@@ -64,6 +63,20 @@ inline int perform_ioctl(int fd, struct uvc_xu_control_query* query) {
 
 inline int perform_videoc_querycap(int fd, struct v4l2_capability* cap) {
     return ioctl(fd, IOCTL_VIDEOC_QUERYCAP, cap);
+}
+
+/** device_caps is preferred; older drivers only fill capabilities. */
+inline __u32 v4l2_effective_caps(const struct v4l2_capability& cap) {
+    return cap.device_caps ? cap.device_caps : cap.capabilities;
+}
+
+/** True if this V4L2 node can allocate capture buffers / stream video. */
+inline bool v4l2_fd_has_video_capture(int fd) {
+    struct v4l2_capability cap {};
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) {
+        return false;
+    }
+    return (v4l2_effective_caps(cap) & V4L2_CAP_VIDEO_CAPTURE) != 0;
 }
 
 class V4L2Capability {

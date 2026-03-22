@@ -37,7 +37,7 @@ protected:
 
 // Test for setting AI mode
 TEST_F(CameraTest, SetAIMode) {
-    camera.set_ai_mode(AIMode::NormalTracking);
+    EXPECT_TRUE(camera.set_ai_mode(AIMode::NormalTracking));
     EXPECT_NO_THROW(camera.get_ai_mode());
 }
 
